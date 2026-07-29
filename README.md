@@ -146,6 +146,8 @@ need telemetry exported before shutdown.
 Application → Stacktrail SDK → Stacktrail Backend → Database
 ```
 
+For hosted HTTPS ingestion, `StartJob` also sends an asynchronous start signal. This allows Stacktrail to identify jobs that crash before their final trace is delivered without affecting application work.
+
 ### OTLP collector ingestion
 
 ```text

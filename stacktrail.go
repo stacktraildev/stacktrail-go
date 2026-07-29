@@ -43,7 +43,8 @@ var defaultClient struct {
 type client struct {
 	tracer         trace.Tracer
 	tracerProvider *sdktrace.TracerProvider
-	apiKey         string
+	environment    string
+	beacons        *beaconDispatcher
 }
 
 // Config holds advanced configuration for a private or local OpenTelemetry
@@ -208,10 +209,16 @@ func newClient(ctx context.Context, config Config) (*client, error) {
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
+	var beacons *beaconDispatcher
+	if endpoint := beaconEndpoint(config); endpoint != "" {
+		beacons = newBeaconDispatcher(endpoint, config.APIKey)
+	}
+
 	return &client{
 		tracer:         provider.Tracer("stacktrail-sdk"),
 		tracerProvider: provider,
-		apiKey:         config.APIKey,
+		environment:    config.Environment,
+		beacons:        beacons,
 	}, nil
 }
 
@@ -307,11 +314,25 @@ func (c *client) startJob(ctx context.Context, jobName string) *Job {
 			attribute.String("job.type", "background"),
 		),
 	)
+	startedAt := time.Now().UTC()
+
+	if c.beacons != nil {
+		spanContext := span.SpanContext()
+		if spanContext.IsValid() {
+			c.beacons.enqueue(beaconPayload{
+				TraceID:     spanContext.TraceID().String(),
+				SpanID:      spanContext.SpanID().String(),
+				JobName:     jobName,
+				StartedAt:   startedAt.Format(time.RFC3339Nano),
+				Environment: c.environment,
+			})
+		}
+	}
 
 	return &Job{
 		ctx:       ctx,
 		span:      span,
-		startTime: time.Now(),
+		startTime: startedAt,
 		metadata:  make(map[string]interface{}),
 		client:    c,
 	}
@@ -416,5 +437,9 @@ func Shutdown(ctx context.Context) error {
 }
 
 func (c *client) Shutdown(ctx context.Context) error {
-	return c.tracerProvider.Shutdown(ctx)
+	var beaconErr error
+	if c.beacons != nil {
+		beaconErr = c.beacons.shutdown(ctx)
+	}
+	return errors.Join(beaconErr, c.tracerProvider.Shutdown(ctx))
 }
