@@ -29,6 +29,7 @@ const (
 	envServiceName       = "STACKTRAIL_SERVICE_NAME"
 	envTransport         = "STACKTRAIL_TRANSPORT"
 	envCollectorEndpoint = "STACKTRAIL_COLLECTOR_ENDPOINT"
+	envEnvironment       = "STACKTRAIL_ENV"
 	envSecure            = "STACKTRAIL_SECURE"
 
 	defaultHostedEndpoint = "api.stacktrail.com:443"
@@ -50,6 +51,7 @@ type client struct {
 type Config struct {
 	APIKey                 string // Stacktrail API key. It is used only for exporter authentication.
 	CollectorEndpoint      string // Optional custom OTLP endpoint for advanced or collector-based setups.
+	Environment            string
 	ServiceName            string // Emitting service name; defaults to the executable name.
 	UseHTTP                bool   // Use HTTP instead of gRPC (defaults to false).
 	AllowInsecureTransport bool   // Allow a non-TLS connection; use only for local development.
@@ -83,6 +85,7 @@ func InitWithConfig(ctx context.Context, config Config) error {
 func configFromEnv() (Config, error) {
 	config := Config{
 		APIKey:            strings.TrimSpace(os.Getenv(envAPIKey)),
+		Environment:       strings.TrimSpace(os.Getenv(envEnvironment)),
 		ServiceName:       strings.TrimSpace(os.Getenv(envServiceName)),
 		CollectorEndpoint: strings.TrimSpace(os.Getenv(envCollectorEndpoint)),
 		UseHTTP:           true,
@@ -157,6 +160,12 @@ func newClient(ctx context.Context, config Config) (*client, error) {
 	if strings.TrimSpace(config.APIKey) == "" {
 		return nil, errors.New("API key is required")
 	}
+	config.Environment = strings.TrimSpace(config.Environment)
+	switch config.Environment {
+	case "development", "staging", "production":
+	default:
+		return nil, fmt.Errorf("%s must be development, staging, or production", envEnvironment)
+	}
 
 	if config.CollectorEndpoint == "" {
 		if config.UseHTTP {
@@ -183,7 +192,10 @@ func newClient(ctx context.Context, config Config) (*client, error) {
 	}
 
 	res, err := resource.New(ctx,
-		resource.WithAttributes(semconv.ServiceName(config.ServiceName)),
+		resource.WithAttributes(
+			semconv.ServiceName(config.ServiceName),
+			attribute.String("deployment.environment", config.Environment),
+		),
 	)
 	if err != nil {
 		_ = exporter.Shutdown(ctx)

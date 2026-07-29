@@ -19,6 +19,7 @@ Create a `.env` file:
 ```dotenv
 STACKTRAIL_API_KEY=st_your_api_key
 STACKTRAIL_SERVICE_NAME=report-worker
+STACKTRAIL_ENV=development
 
 # Optional. These are the hosted-ingestion defaults.
 STACKTRAIL_TRANSPORT=http
@@ -65,6 +66,7 @@ func main() {
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `STACKTRAIL_API_KEY` | Yes | — | Authenticates ingestion and identifies the Stacktrail project. |
+| `STACKTRAIL_ENV` | Yes | — | Must be `development`, `staging`, or `production`. Powers the Jobs environment filter. |
 | `STACKTRAIL_SERVICE_NAME` | No | Executable name | Service name attached to telemetry. |
 | `STACKTRAIL_TRANSPORT` | No | `http` | Use `grpc` only when sending through an OTLP collector. |
 | `STACKTRAIL_COLLECTOR_ENDPOINT` | No | `localhost:4317` | OTLP collector host and port. Requires `STACKTRAIL_TRANSPORT=grpc`. |
@@ -84,6 +86,7 @@ For a local OTLP collector:
 ```dotenv
 STACKTRAIL_API_KEY=st_your_api_key
 STACKTRAIL_SERVICE_NAME=report-worker
+STACKTRAIL_ENV=development
 STACKTRAIL_TRANSPORT=grpc
 STACKTRAIL_COLLECTOR_ENDPOINT=localhost:4317
 STACKTRAIL_SECURE=false
