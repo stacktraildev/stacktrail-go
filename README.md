@@ -4,7 +4,7 @@ Distributed tracing for asynchronous Go workloads.
 
 ## Contents
 
-[Installation](#installation) | [Quick start](#quick-start) | [Configuration](#configuration) | [Job tracking](#job-tracking) | [Architecture](#architecture) | [More examples](#more-examples)
+[Installation](#installation) | [Quick start](#quick-start) | [Configuration](#configuration) | [Job tracking](#job-tracking) | [Context propagation](#context-propagation) | [Architecture](#architecture) | [More examples](#more-examples)
 
 ## Installation
 
@@ -125,6 +125,21 @@ email.Success()
 
 parent.Success()
 ```
+
+### Context propagation
+
+Pass a job context when work continues across an application-owned asynchronous
+boundary outside direct nesting:
+
+```go
+parent := stacktrail.StartJob(ctx, "process-order")
+
+followUp := stacktrail.StartJob(parent.Context(), "send-follow-up")
+followUp.Success()
+parent.Success()
+```
+
+Pass the parent context explicitly when it is needed.
 
 ### Events
 
