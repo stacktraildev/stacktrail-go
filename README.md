@@ -68,20 +68,34 @@ func main() {
 | `STACKTRAIL_API_KEY` | Yes | — | Authenticates ingestion and identifies the Stacktrail project. |
 | `STACKTRAIL_ENV` | Yes | — | Must be `development`, `staging`, or `production`. Powers the Jobs environment filter. |
 | `STACKTRAIL_SERVICE_NAME` | No | Executable name | Service name attached to telemetry. |
-| `STACKTRAIL_TRANSPORT` | No | `http` | Use `grpc` only when sending through an OTLP collector. |
-| `STACKTRAIL_COLLECTOR_ENDPOINT` | No | `localhost:4317` | OTLP collector host and port. Requires `STACKTRAIL_TRANSPORT=grpc`. |
-| `STACKTRAIL_SECURE` | No | `true` | Set `false` only for a local collector without TLS. Requires `STACKTRAIL_TRANSPORT=grpc`. |
+| `STACKTRAIL_TRANSPORT` | No | `http` | Selects the OTLP/HTTP transport. Stacktrail sends telemetry over HTTPS by default. Use `grpc` for an OTLP collector. |
+| `STACKTRAIL_COLLECTOR_ENDPOINT` | No | Hosted HTTPS endpoint or `localhost:4317` for gRPC | A custom HTTP(S) URL or host and port for OTLP/HTTP; a host and port for gRPC. |
+| `STACKTRAIL_SECURE` | No | `true` | TLS setting. It must match an explicit HTTP URL scheme: `https://` requires `true`; `http://` requires `false`. |
 
 ### Transport behavior
 
 | Use case | `STACKTRAIL_TRANSPORT` | `STACKTRAIL_COLLECTOR_ENDPOINT` | `STACKTRAIL_SECURE` | Result |
 | --- | --- | --- | --- | --- |
-| Stacktrail hosted ingestion | Omit or `http` | Omit | Omit or `true` | The SDK sends telemetry directly to Stacktrail over HTTPS. |
-| Private collector with TLS | `grpc` | Collector host and port | `true` | The SDK sends telemetry to the collector over TLS. |
-| Local collector | `grpc` | `localhost:4317` or another local host and port | `false` | The SDK sends telemetry to the collector without TLS. |
-| Invalid hosted setup | `http` | Any value | `false` | Initialization fails. Direct hosted ingestion does not allow a custom endpoint or disabled TLS. |
+| Stacktrail hosted ingestion (HTTPS by default) | Omit or `http` | Omit | Omit or `true` | Sends telemetry directly to Stacktrail over HTTPS. Start beacons are available only when using the hosted service. |
+| Private HTTPS ingestion | `http` | `https://collector.example.com` | `true` | Sends telemetry to the custom HTTPS endpoint. |
+| Local HTTP ingestion | `http` | `http://127.0.0.1:4318` | `false` | Sends telemetry to a local or private HTTP endpoint. |
+| TLS gRPC collector | `grpc` | Collector host and port | `true` | Sends telemetry to the collector over TLS. |
+| Local gRPC collector | `grpc` | `localhost:4317` or another local host and port | `false` | Sends telemetry to the collector without TLS. |
 
-For a local OTLP collector:
+Use a complete HTTP(S) URL when the collector has a non-default trace path. Otherwise, the SDK appends `/v1/traces`. A bare HTTP host and port derives its scheme from `STACKTRAIL_SECURE`. Custom HTTP(S) endpoints and all gRPC collectors do not send hosted start beacons.
+
+For a local OTLP/HTTP collector:
+
+```dotenv
+STACKTRAIL_API_KEY=st_your_api_key
+STACKTRAIL_SERVICE_NAME=report-worker
+STACKTRAIL_ENV=development
+STACKTRAIL_TRANSPORT=http
+STACKTRAIL_COLLECTOR_ENDPOINT=http://127.0.0.1:4318
+STACKTRAIL_SECURE=false
+```
+
+For a local gRPC collector:
 
 ```dotenv
 STACKTRAIL_API_KEY=st_your_api_key

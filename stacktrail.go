@@ -47,15 +47,14 @@ type client struct {
 	beacons        *beaconDispatcher
 }
 
-// Config holds advanced configuration for a private or local OpenTelemetry
-// collector. The API key determines the Stacktrail project.
-type Config struct {
-	APIKey                 string // Stacktrail API key. It is used only for exporter authentication.
-	CollectorEndpoint      string // Optional custom OTLP endpoint for advanced or collector-based setups.
-	Environment            string
-	ServiceName            string // Emitting service name; defaults to the executable name.
-	UseHTTP                bool   // Use HTTP instead of gRPC (defaults to false).
-	AllowInsecureTransport bool   // Allow a non-TLS connection; use only for local development.
+type sdkConfig struct {
+	apiKey                 string
+	collectorEndpoint      string
+	environment            string
+	serviceName            string
+	useHTTP                bool
+	allowInsecureTransport bool
+	hostedHTTP             bool
 }
 
 // LoadDotEnv loads one explicit .env file without overwriting values already
@@ -74,46 +73,69 @@ func Init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return initWithConfig(ctx, config)
+	newClient, err := newClient(ctx, config)
+	if err != nil {
+		return err
+	}
+	if err := installDefaultClient(newClient); err != nil {
+		_ = newClient.Shutdown(ctx)
+		return err
+	}
+	return nil
 }
 
-// InitWithConfig configures Stacktrail's package-level client for advanced
-// private or local OpenTelemetry collector setups.
-func InitWithConfig(ctx context.Context, config Config) error {
-	return initWithConfig(ctx, config)
-}
-
-func configFromEnv() (Config, error) {
-	config := Config{
-		APIKey:            strings.TrimSpace(os.Getenv(envAPIKey)),
-		Environment:       strings.TrimSpace(os.Getenv(envEnvironment)),
-		ServiceName:       strings.TrimSpace(os.Getenv(envServiceName)),
-		CollectorEndpoint: strings.TrimSpace(os.Getenv(envCollectorEndpoint)),
-		UseHTTP:           true,
+func configFromEnv() (sdkConfig, error) {
+	config := sdkConfig{
+		apiKey:            strings.TrimSpace(os.Getenv(envAPIKey)),
+		environment:       strings.TrimSpace(os.Getenv(envEnvironment)),
+		serviceName:       strings.TrimSpace(os.Getenv(envServiceName)),
+		collectorEndpoint: strings.TrimSpace(os.Getenv(envCollectorEndpoint)),
+		useHTTP:           true,
 	}
 
 	if transport, ok := os.LookupEnv(envTransport); ok && strings.TrimSpace(transport) != "" {
 		switch strings.ToLower(strings.TrimSpace(transport)) {
-		case "http", "https":
-			config.UseHTTP = true
+		case "http":
+			config.useHTTP = true
 		case "grpc":
-			config.UseHTTP = false
+			config.useHTTP = false
 		default:
-			return Config{}, fmt.Errorf("%s must be http or grpc", envTransport)
+			return sdkConfig{}, fmt.Errorf("%s must be http or grpc", envTransport)
 		}
 	}
 
 	secure, err := secureEnv()
 	if err != nil {
-		return Config{}, err
+		return sdkConfig{}, err
 	}
-	if config.UseHTTP && config.CollectorEndpoint != "" {
-		return Config{}, fmt.Errorf("%s requires %s=grpc", envCollectorEndpoint, envTransport)
+	config.allowInsecureTransport = !secure
+
+	if !config.useHTTP {
+		if config.collectorEndpoint == "" {
+			config.collectorEndpoint = "localhost:4317"
+		}
+		if strings.Contains(config.collectorEndpoint, "://") {
+			return sdkConfig{}, fmt.Errorf("gRPC endpoint must be host:port, not a URL: %q", config.collectorEndpoint)
+		}
+		return config, nil
 	}
-	if config.UseHTTP && !secure {
-		return Config{}, fmt.Errorf("%s=false requires %s=grpc", envSecure, envTransport)
+
+	if config.collectorEndpoint == "" {
+		if !secure {
+			return sdkConfig{}, fmt.Errorf("%s=false requires an explicit custom HTTP endpoint", envSecure)
+		}
+		config.collectorEndpoint = defaultHostedEndpoint
+		config.hostedHTTP = true
+		return config, nil
 	}
-	config.AllowInsecureTransport = !secure
+
+	if err := validateHTTPEndpoint(config.collectorEndpoint, secure); err != nil {
+		return sdkConfig{}, err
+	}
+	if !secure && isHostedHTTPEndpoint(config.collectorEndpoint) {
+		return sdkConfig{}, fmt.Errorf("%s=false requires a custom non-hosted HTTP endpoint", envSecure)
+	}
+	config.hostedHTTP = secure && isDefaultHostedHTTPEndpoint(config.collectorEndpoint)
 	return config, nil
 }
 
@@ -129,16 +151,64 @@ func secureEnv() (bool, error) {
 	return secure, nil
 }
 
-func initWithConfig(ctx context.Context, config Config) error {
-	newClient, err := newClient(ctx, config)
-	if err != nil {
-		return err
+func validateHTTPEndpoint(rawEndpoint string, secure bool) error {
+	if strings.ContainsAny(rawEndpoint, "?#") {
+		return fmt.Errorf("HTTP endpoint must not include a query string or fragment: %q", rawEndpoint)
 	}
-	if err := installDefaultClient(newClient); err != nil {
-		_ = newClient.Shutdown(ctx)
-		return err
+	if strings.Contains(rawEndpoint, "://") {
+		endpoint, err := url.Parse(rawEndpoint)
+		if err != nil || endpoint.Scheme == "" || endpoint.Host == "" || endpoint.User != nil {
+			return fmt.Errorf("HTTP endpoint must be a valid URL: %q", rawEndpoint)
+		}
+		switch endpoint.Scheme {
+		case "https":
+			if !secure {
+				return fmt.Errorf("%s=true is required for HTTPS endpoints", envSecure)
+			}
+		case "http":
+			if secure {
+				return fmt.Errorf("%s=false is required for HTTP endpoints", envSecure)
+			}
+		default:
+			return fmt.Errorf("HTTP endpoint must use http or https: %q", rawEndpoint)
+		}
+		return nil
+	}
+
+	endpoint, err := url.Parse("//" + rawEndpoint)
+	if err != nil || endpoint.Host == "" || endpoint.User != nil || (endpoint.Path != "" && endpoint.Path != "/") {
+		return fmt.Errorf("HTTP endpoint must be a host:port or a valid URL: %q", rawEndpoint)
 	}
 	return nil
+}
+
+func isHostedHTTPEndpoint(rawEndpoint string) bool {
+	endpoint := rawEndpoint
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "//" + endpoint
+	}
+	parsed, err := url.Parse(endpoint)
+	return err == nil && strings.EqualFold(parsed.Hostname(), "api.stacktrail.com")
+}
+
+func isDefaultHostedHTTPEndpoint(rawEndpoint string) bool {
+	endpoint := rawEndpoint
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "api.stacktrail.com") {
+		return false
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return false
+	}
+	switch parsed.Path {
+	case "", "/", "/v1/traces":
+		return true
+	default:
+		return false
+	}
 }
 
 func installDefaultClient(client *client) error {
@@ -157,33 +227,25 @@ func configuredClient() *client {
 	return defaultClient.client
 }
 
-func newClient(ctx context.Context, config Config) (*client, error) {
-	if strings.TrimSpace(config.APIKey) == "" {
+func newClient(ctx context.Context, config sdkConfig) (*client, error) {
+	if config.apiKey == "" {
 		return nil, errors.New("API key is required")
 	}
-	config.Environment = strings.TrimSpace(config.Environment)
-	switch config.Environment {
+	switch config.environment {
 	case "development", "staging", "production":
 	default:
 		return nil, fmt.Errorf("%s must be development, staging, or production", envEnvironment)
 	}
 
-	if config.CollectorEndpoint == "" {
-		if config.UseHTTP {
-			config.CollectorEndpoint = defaultHostedEndpoint
-		} else {
-			config.CollectorEndpoint = "localhost:4317"
-		}
-	}
-	if config.ServiceName == "" {
-		config.ServiceName = defaultServiceName()
+	if config.serviceName == "" {
+		config.serviceName = defaultServiceName()
 	}
 
 	var (
 		exporter *otlptrace.Exporter
 		err      error
 	)
-	if config.UseHTTP {
+	if config.useHTTP {
 		exporter, err = newHTTPExporter(ctx, config)
 	} else {
 		exporter, err = newGRPCExporter(ctx, config)
@@ -194,8 +256,8 @@ func newClient(ctx context.Context, config Config) (*client, error) {
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
-			semconv.ServiceName(config.ServiceName),
-			attribute.String("deployment.environment", config.Environment),
+			semconv.ServiceName(config.serviceName),
+			attribute.String("deployment.environment", config.environment),
 		),
 	)
 	if err != nil {
@@ -211,13 +273,13 @@ func newClient(ctx context.Context, config Config) (*client, error) {
 
 	var beacons *beaconDispatcher
 	if endpoint := beaconEndpoint(config); endpoint != "" {
-		beacons = newBeaconDispatcher(endpoint, config.APIKey)
+		beacons = newBeaconDispatcher(endpoint, config.apiKey)
 	}
 
 	return &client{
 		tracer:         provider.Tracer("stacktrail-sdk"),
 		tracerProvider: provider,
-		environment:    config.Environment,
+		environment:    config.environment,
 		beacons:        beacons,
 	}, nil
 }
@@ -234,24 +296,15 @@ func defaultServiceName() string {
 	return name
 }
 
-func newHTTPExporter(ctx context.Context, config Config) (*otlptrace.Exporter, error) {
+func newHTTPExporter(ctx context.Context, config sdkConfig) (*otlptrace.Exporter, error) {
 	httpOpts := []otlptracehttp.Option{
-		otlptracehttp.WithHeaders(map[string]string{"X-API-Key": config.APIKey}),
+		otlptracehttp.WithHeaders(map[string]string{"X-API-Key": config.apiKey}),
 	}
 
-	if strings.Contains(config.CollectorEndpoint, "://") {
-		endpoint, err := url.Parse(config.CollectorEndpoint)
-		if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
-			return nil, fmt.Errorf("HTTP endpoint must be a valid URL: %q", config.CollectorEndpoint)
-		}
-		if endpoint.Scheme != "https" && endpoint.Scheme != "http" {
-			return nil, fmt.Errorf("HTTP endpoint must use http or https: %q", config.CollectorEndpoint)
-		}
-		if endpoint.RawQuery != "" || endpoint.Fragment != "" {
-			return nil, fmt.Errorf("HTTP endpoint must not include a query string or fragment: %q", config.CollectorEndpoint)
-		}
-		if endpoint.Scheme == "http" && !config.AllowInsecureTransport {
-			return nil, fmt.Errorf("HTTP endpoint uses insecure transport; allow it only for local development")
+	if strings.Contains(config.collectorEndpoint, "://") {
+		endpoint, err := url.Parse(config.collectorEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("HTTP endpoint must be a valid URL: %q", config.collectorEndpoint)
 		}
 		if endpoint.Path == "" || endpoint.Path == "/" {
 			endpoint.Path = "/v1/traces"
@@ -259,27 +312,22 @@ func newHTTPExporter(ctx context.Context, config Config) (*otlptrace.Exporter, e
 		httpOpts = append(httpOpts, otlptracehttp.WithEndpointURL(endpoint.String()))
 	} else {
 		httpOpts = append(httpOpts,
-			otlptracehttp.WithEndpoint(config.CollectorEndpoint),
+			otlptracehttp.WithEndpoint(config.collectorEndpoint),
 			otlptracehttp.WithURLPath("/v1/traces"),
 		)
-	}
-
-	if config.AllowInsecureTransport {
-		httpOpts = append(httpOpts, otlptracehttp.WithInsecure())
+		if config.allowInsecureTransport {
+			httpOpts = append(httpOpts, otlptracehttp.WithInsecure())
+		}
 	}
 	return otlptracehttp.New(ctx, httpOpts...)
 }
 
-func newGRPCExporter(ctx context.Context, config Config) (*otlptrace.Exporter, error) {
-	if strings.Contains(config.CollectorEndpoint, "://") {
-		return nil, fmt.Errorf("gRPC endpoint must be host:port, not a URL: %q", config.CollectorEndpoint)
-	}
-
+func newGRPCExporter(ctx context.Context, config sdkConfig) (*otlptrace.Exporter, error) {
 	grpcOpts := []otlptracegrpc.Option{
-		otlptracegrpc.WithEndpoint(config.CollectorEndpoint),
-		otlptracegrpc.WithHeaders(map[string]string{"X-API-Key": config.APIKey}),
+		otlptracegrpc.WithEndpoint(config.collectorEndpoint),
+		otlptracegrpc.WithHeaders(map[string]string{"X-API-Key": config.apiKey}),
 	}
-	if config.AllowInsecureTransport {
+	if config.allowInsecureTransport {
 		grpcOpts = append(grpcOpts, otlptracegrpc.WithInsecure())
 	}
 	return otlptracegrpc.New(ctx, grpcOpts...)
@@ -297,7 +345,7 @@ type Job struct {
 }
 
 // StartJob starts a job through Stacktrail's package-level client. Call Init
-// or InitWithConfig successfully before using this function.
+// successfully before using this function.
 func StartJob(ctx context.Context, jobName string) *Job {
 	client := configuredClient()
 	if client == nil {
@@ -411,7 +459,7 @@ func (j *Job) AddEvent(name string, attributes ...attribute.KeyValue) {
 }
 
 // ForceFlush exports all spans buffered by the package-level client before ctx
-// is cancelled. Call Init or InitWithConfig first.
+// is cancelled. Call Init first.
 func ForceFlush(ctx context.Context) error {
 	client := configuredClient()
 	if client == nil {

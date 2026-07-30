@@ -63,8 +63,8 @@ func newBeaconDispatcher(endpoint, apiKey string) *beaconDispatcher {
 	return dispatcher
 }
 
-func beaconEndpoint(config Config) string {
-	if !config.UseHTTP || config.AllowInsecureTransport || config.CollectorEndpoint != defaultHostedEndpoint {
+func beaconEndpoint(config sdkConfig) string {
+	if !config.hostedHTTP {
 		return ""
 	}
 	return "https://" + defaultHostedEndpoint + "/v1/job-started"
