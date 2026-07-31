@@ -41,7 +41,7 @@ func newBeaconDispatcher(endpoint, apiKey string) *beaconDispatcher {
 	dispatcher := &beaconDispatcher{
 		endpoint: endpoint,
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: beaconRequestTimeout},
+		client:   newNoRedirectHTTPClient(beaconRequestTimeout),
 		queue:    make(chan beaconPayload, beaconQueueCapacity),
 		done:     make(chan struct{}),
 		ctx:      ctx,
@@ -135,4 +135,7 @@ func (d *beaconDispatcher) send(payload beaconPayload) {
 	}
 	_, _ = io.Copy(io.Discard, response.Body)
 	_ = response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return
+	}
 }

@@ -1,3 +1,9 @@
 # Local SDK test and development programs
 examples/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
 .DS_Store

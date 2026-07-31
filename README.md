@@ -35,6 +35,7 @@ package main
 import (
     "context"
     "log"
+    "time"
 
     "github.com/stacktraildev/stacktrail-go"
 )
@@ -48,7 +49,13 @@ func main() {
     if err := stacktrail.Init(ctx); err != nil {
         log.Fatal(err)
     }
-    defer func() { _ = stacktrail.Shutdown(ctx) }()
+    defer func() {
+        shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
+        if err := stacktrail.Shutdown(shutdownCtx); err != nil {
+            log.Printf("shut down Stacktrail: %v", err)
+        }
+    }()
 
     job := stacktrail.StartJob(ctx, "generate-report")
     job.AddMetadata("report.type", "weekly")
@@ -82,7 +89,9 @@ func main() {
 | TLS gRPC collector | `grpc` | Collector host and port | `true` | Sends telemetry to the collector over TLS. |
 | Local gRPC collector | `grpc` | `localhost:4317` or another local host and port | `false` | Sends telemetry to the collector without TLS. |
 
-Use a complete HTTP(S) URL when the collector has a non-default trace path. Otherwise, the SDK appends `/v1/traces`. A bare HTTP host and port derives its scheme from `STACKTRAIL_SECURE`. Custom HTTP(S) endpoints and all gRPC collectors do not send hosted start beacons.
+Use a complete HTTP(S) URL when the collector has a non-default trace path. Otherwise, the SDK appends `/v1/traces`. A bare HTTP host and port derives its scheme from `STACKTRAIL_SECURE`. Start signals are available only when using the hosted service; custom HTTP(S) endpoints and all gRPC collectors do not send them.
+
+Custom collectors are trusted destinations and receive the Stacktrail API key as exporter authentication. Configure the final collector URL directly because the SDK rejects HTTP redirects.
 
 For a local OTLP/HTTP collector:
 
@@ -124,7 +133,28 @@ return nil
 ```
 
 `job.End(nil)` records success and `job.End(err)` records failure. Completion is
-idempotent and safe to invoke concurrently.
+idempotent and safe to invoke concurrently. Job names, event names, metadata,
+and exported error text are bounded. Failure messages are automatically
+redacted for common credentials, tokens, URL credentials, and email addresses.
+The SDK also extracts provider-neutral HTTP status, code, category, service,
+and retryability facts from standard interfaces, common structured error
+fields, and JSON API errors.
+
+For provider errors that do not identify their service, attach facts without
+writing display prose:
+
+```go
+if err := sendEmail(); err != nil {
+    job.Fail(stacktrail.WithErrorDetails(err, stacktrail.ErrorDetails{
+        Service: "resend",
+    }))
+    return err
+}
+```
+
+`WithErrorDetails` preserves `errors.Is` and `errors.As`. Automatic redaction is
+defense in depth; applications should still avoid placing domain-specific
+secrets or sensitive payload bodies in error messages.
 
 ### Nested jobs
 

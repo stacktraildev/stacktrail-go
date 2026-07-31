@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	envAPIKey            = "STACKTRAIL_API_KEY"
+	envAPIKey            = "STACKTRAIL_API_KEY" // #nosec G101 -- environment variable name, not a credential
 	envServiceName       = "STACKTRAIL_SERVICE_NAME"
 	envTransport         = "STACKTRAIL_TRANSPORT"
 	envCollectorEndpoint = "STACKTRAIL_COLLECTOR_ENDPOINT"
@@ -114,8 +114,8 @@ func configFromEnv() (sdkConfig, error) {
 		if config.collectorEndpoint == "" {
 			config.collectorEndpoint = "localhost:4317"
 		}
-		if strings.Contains(config.collectorEndpoint, "://") {
-			return sdkConfig{}, fmt.Errorf("gRPC endpoint must be host:port, not a URL: %q", config.collectorEndpoint)
+		if err := validateGRPCEndpoint(config.collectorEndpoint); err != nil {
+			return sdkConfig{}, err
 		}
 		return config, nil
 	}
@@ -153,12 +153,12 @@ func secureEnv() (bool, error) {
 
 func validateHTTPEndpoint(rawEndpoint string, secure bool) error {
 	if strings.ContainsAny(rawEndpoint, "?#") {
-		return fmt.Errorf("HTTP endpoint must not include a query string or fragment: %q", rawEndpoint)
+		return errors.New("HTTP endpoint must not include a query string or fragment")
 	}
 	if strings.Contains(rawEndpoint, "://") {
 		endpoint, err := url.Parse(rawEndpoint)
 		if err != nil || endpoint.Scheme == "" || endpoint.Host == "" || endpoint.User != nil {
-			return fmt.Errorf("HTTP endpoint must be a valid URL: %q", rawEndpoint)
+			return errors.New("HTTP endpoint must be a valid URL without credentials")
 		}
 		switch endpoint.Scheme {
 		case "https":
@@ -170,14 +170,14 @@ func validateHTTPEndpoint(rawEndpoint string, secure bool) error {
 				return fmt.Errorf("%s=false is required for HTTP endpoints", envSecure)
 			}
 		default:
-			return fmt.Errorf("HTTP endpoint must use http or https: %q", rawEndpoint)
+			return errors.New("HTTP endpoint must use http or https")
 		}
 		return nil
 	}
 
 	endpoint, err := url.Parse("//" + rawEndpoint)
 	if err != nil || endpoint.Host == "" || endpoint.User != nil || (endpoint.Path != "" && endpoint.Path != "/") {
-		return fmt.Errorf("HTTP endpoint must be a host:port or a valid URL: %q", rawEndpoint)
+		return errors.New("HTTP endpoint must be a host:port or a valid URL without credentials")
 	}
 	return nil
 }
@@ -265,10 +265,13 @@ func newClient(ctx context.Context, config sdkConfig) (*client, error) {
 		return nil, fmt.Errorf("create telemetry resource: %w", err)
 	}
 
+	spanLimits := sdktrace.NewSpanLimits()
+	spanLimits.AttributeValueLengthLimit = maxTelemetryValueRunes
 	provider := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithRawSpanLimits(spanLimits),
 	)
 
 	var beacons *beaconDispatcher
@@ -299,12 +302,13 @@ func defaultServiceName() string {
 func newHTTPExporter(ctx context.Context, config sdkConfig) (*otlptrace.Exporter, error) {
 	httpOpts := []otlptracehttp.Option{
 		otlptracehttp.WithHeaders(map[string]string{"X-API-Key": config.apiKey}),
+		otlptracehttp.WithHTTPClient(newNoRedirectHTTPClient(otlpRequestTimeout)),
 	}
 
 	if strings.Contains(config.collectorEndpoint, "://") {
 		endpoint, err := url.Parse(config.collectorEndpoint)
 		if err != nil {
-			return nil, fmt.Errorf("HTTP endpoint must be a valid URL: %q", config.collectorEndpoint)
+			return nil, errors.New("HTTP endpoint must be a valid URL")
 		}
 		if endpoint.Path == "" || endpoint.Path == "/" {
 			endpoint.Path = "/v1/traces"
@@ -335,13 +339,11 @@ func newGRPCExporter(ctx context.Context, config sdkConfig) (*otlptrace.Exporter
 
 // Job represents a background job execution.
 type Job struct {
-	ctx        context.Context
-	span       trace.Span
-	startTime  time.Time
-	metadata   map[string]interface{}
-	metadataMu sync.Mutex
-	endOnce    sync.Once
-	client     *client
+	ctx       context.Context
+	span      trace.Span
+	startTime time.Time
+	endOnce   sync.Once
+	client    *client
 }
 
 // StartJob starts a job through Stacktrail's package-level client. Call Init
@@ -355,6 +357,7 @@ func StartJob(ctx context.Context, jobName string) *Job {
 }
 
 func (c *client) startJob(ctx context.Context, jobName string) *Job {
+	jobName = normalizeJobName(jobName)
 	ctx, span := c.tracer.Start(ctx, jobName,
 		trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(
@@ -381,30 +384,31 @@ func (c *client) startJob(ctx context.Context, jobName string) *Job {
 		ctx:       ctx,
 		span:      span,
 		startTime: startedAt,
-		metadata:  make(map[string]interface{}),
 		client:    c,
 	}
 }
 
-// AddMetadata adds metadata to the job.
+// AddMetadata adds metadata to the job. Blank keys are ignored.
 func (j *Job) AddMetadata(key string, value interface{}) {
-	j.metadataMu.Lock()
-	j.metadata[key] = value
-	j.metadataMu.Unlock()
+	key, ok := normalizeMetadataKey(key)
+	if !ok {
+		return
+	}
+	attributeKey := "metadata." + key
 
 	switch v := value.(type) {
 	case string:
-		j.span.SetAttributes(attribute.String(fmt.Sprintf("metadata.%s", key), v))
+		j.span.SetAttributes(attribute.String(attributeKey, truncateRunes(v, maxTelemetryValueRunes)))
 	case int:
-		j.span.SetAttributes(attribute.Int(fmt.Sprintf("metadata.%s", key), v))
+		j.span.SetAttributes(attribute.Int(attributeKey, v))
 	case int64:
-		j.span.SetAttributes(attribute.Int64(fmt.Sprintf("metadata.%s", key), v))
+		j.span.SetAttributes(attribute.Int64(attributeKey, v))
 	case float64:
-		j.span.SetAttributes(attribute.Float64(fmt.Sprintf("metadata.%s", key), v))
+		j.span.SetAttributes(attribute.Float64(attributeKey, v))
 	case bool:
-		j.span.SetAttributes(attribute.Bool(fmt.Sprintf("metadata.%s", key), v))
+		j.span.SetAttributes(attribute.Bool(attributeKey, v))
 	default:
-		j.span.SetAttributes(attribute.String(fmt.Sprintf("metadata.%s", key), fmt.Sprintf("%v", v)))
+		j.span.SetAttributes(attribute.String(attributeKey, truncateRunes(fmt.Sprintf("%v", v), maxTelemetryValueRunes)))
 	}
 }
 
@@ -417,13 +421,19 @@ func (j *Job) End(err error) {
 			j.span.SetStatus(codes.Ok, "Job completed successfully")
 			j.span.SetAttributes(attribute.String("job.status", "success"), duration)
 		} else {
-			j.span.RecordError(err)
-			j.span.SetStatus(codes.Error, err.Error())
-			j.span.SetAttributes(
+			details := inspectError(err)
+			message := details.Message
+			// Record only the redacted message. Passing the original error to
+			// RecordError would duplicate potentially sensitive text in the
+			// OpenTelemetry exception event.
+			j.span.RecordError(errors.New(message))
+			j.span.SetStatus(codes.Error, message)
+			attributes := []attribute.KeyValue{
 				attribute.String("job.status", "failed"),
-				attribute.String("job.error", err.Error()),
 				duration,
-			)
+			}
+			attributes = append(attributes, details.attributes()...)
+			j.span.SetAttributes(attributes...)
 		}
 		j.span.End()
 	})
@@ -453,8 +463,12 @@ func (j *Job) StartChildJob(jobName string) *Job {
 	return j.client.startJob(j.ctx, jobName)
 }
 
-// AddEvent adds an event to the job timeline.
+// AddEvent adds an event to the job timeline. Blank names are ignored.
 func (j *Job) AddEvent(name string, attributes ...attribute.KeyValue) {
+	name, ok := normalizeNonemptyName(name)
+	if !ok {
+		return
+	}
 	j.span.AddEvent(name, trace.WithAttributes(attributes...))
 }
 
@@ -485,9 +499,14 @@ func Shutdown(ctx context.Context) error {
 }
 
 func (c *client) Shutdown(ctx context.Context) error {
-	var beaconErr error
-	if c.beacons != nil {
-		beaconErr = c.beacons.shutdown(ctx)
+	if c.beacons == nil {
+		return c.tracerProvider.Shutdown(ctx)
 	}
-	return errors.Join(beaconErr, c.tracerProvider.Shutdown(ctx))
+
+	beaconDone := make(chan error, 1)
+	go func() {
+		beaconDone <- c.beacons.shutdown(ctx)
+	}()
+	providerErr := c.tracerProvider.Shutdown(ctx)
+	return errors.Join(<-beaconDone, providerErr)
 }
