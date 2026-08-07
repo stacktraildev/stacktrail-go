@@ -29,7 +29,7 @@ const (
 	envServiceName       = "STACKTRAIL_SERVICE_NAME"
 	envTransport         = "STACKTRAIL_TRANSPORT"
 	envCollectorEndpoint = "STACKTRAIL_COLLECTOR_ENDPOINT"
-	envEnvironment       = "STACKTRAIL_ENV"
+	envEnvironment       = "STACKTRAIL_ENVIRONMENT"
 	envSecure            = "STACKTRAIL_SECURE"
 
 	defaultHostedEndpoint = "api.stacktrail.com:443"
@@ -139,6 +139,20 @@ func configFromEnv() (sdkConfig, error) {
 	return config, nil
 }
 
+func isValidEnvironment(value string) bool {
+	if len(value) == 0 || len(value) > 20 {
+		return false
+	}
+	for index, char := range value {
+		letter := (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z')
+		digit := char >= '0' && char <= '9'
+		if (index == 0 && !letter && !digit) || (!letter && !digit && char != '.' && char != '_' && char != '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func secureEnv() (bool, error) {
 	value, ok := os.LookupEnv(envSecure)
 	if !ok || strings.TrimSpace(value) == "" {
@@ -231,10 +245,11 @@ func newClient(ctx context.Context, config sdkConfig) (*client, error) {
 	if config.apiKey == "" {
 		return nil, errors.New("API key is required")
 	}
-	switch config.environment {
-	case "development", "staging", "production":
-	default:
-		return nil, fmt.Errorf("%s must be development, staging, or production", envEnvironment)
+	if config.environment == "" {
+		return nil, fmt.Errorf("%s is required", envEnvironment)
+	}
+	if !isValidEnvironment(config.environment) {
+		return nil, fmt.Errorf("%s must be 1-20 letters, numbers, dots, underscores, or hyphens", envEnvironment)
 	}
 
 	if config.serviceName == "" {
